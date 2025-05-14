@@ -3,6 +3,7 @@ war card game client and server
 """
 import asyncio
 from collections import namedtuple
+from csv import reader
 from enum import Enum
 import logging
 import random
@@ -42,21 +43,30 @@ class Result(Enum):
     DRAW = 1
     LOSE = 2
 
-def readexactly(sock, numbytes):
+async def readexactly(sock, numbytes):
     """
     Accumulate exactly `numbytes` from `sock` and return those. If EOF is found
     before numbytes have been received, be sure to account for that here or in
     the caller.
     """
-    # TODO
-    pass
+    data = b''
+    while len(data) < numbytes:
+        chunk = await reader.read(numbytes - len(data))
+        if not chunk:
+            raise ConnectionError("Incomplete data received.")
+        data += chunk
+    return data
 
 
-def kill_game(game):
+async def kill_game(game):
     """
     TODO: If either client sends a bad message, immediately nuke the game.
     """
-    pass
+    logging.error("Killing game due to bad message.")
+    game.p1.close()
+    game.p2.close()
+    await game.p1.wait_closed()
+    await game.p2.wait_closed()
 
 
 def compare_cards(card1, card2):
@@ -64,7 +74,13 @@ def compare_cards(card1, card2):
     TODO: Given an integer card representation, return -1 for card1 < card2,
     0 for card1 = card2, and 1 for card1 > card2
     """
-    pass
+    value1 = card1 % 13
+    value2 = card2 % 13
+    if value1 > value2:
+        return 1
+    elif value1 < value2:
+        return -1
+    return 0
     
 
 def deal_cards():
@@ -72,7 +88,9 @@ def deal_cards():
     TODO: Randomize a deck of cards (list of ints 0..51), and return two
     26 card "hands."
     """
-    pass
+    deck = list(range(52))
+    random.shuffle(deck)
+    return deck[:26], deck[26:]
     
 
 def serve_game(host, port):
@@ -81,7 +99,67 @@ def serve_game(host, port):
     perform the war protocol to serve a game of war between each client.
     This function should run forever, continually serving clients.
     """
-    pass
+    async def handle_game(reader1, writer1, reader2, writer2):
+        game = Game(writer1, writer2)
+        try:
+            msg1 = await readexactly(reader1, 2)
+            msg2 = await readexactly(reader2, 2)
+            if msg1[0] != Command.WANTGAME.value or msg1[1] != 0:
+                await kill_game(game)
+                return
+            if msg2[0] != Command.WANTGAME.value or msg2[1] != 0:
+                await kill_game(game)
+                return
+
+            hand1, hand2 = deal_cards()
+            writer1.write(bytes([Command.GAMESTART.value]) + bytes(hand1))
+            writer2.write(bytes([Command.GAMESTART.value]) + bytes(hand2))
+            await writer1.drain()
+            await writer2.drain()
+
+            used1 = set()
+            used2 = set()
+
+            for _ in range(26):
+                play1 = await readexactly(reader1, 2)
+                play2 = await readexactly(reader2, 2)
+
+                if play1[0] != Command.PLAYCARD.value or play2[0] != Command.PLAYCARD.value:
+                    await kill_game(game)
+                    return
+
+                card1 = play1[1]
+                card2 = play2[1]
+
+                if card1 in used1 or card2 in used2:
+                    await kill_game(game)
+                    return
+
+                used1.add(card1)
+                used2.add(card2)
+
+                result = compare_cards(card1, card2)
+                if result == 1:
+                    writer1.write(bytes([Command.PLAYRESULT.value, Result.WIN.value]))
+                    writer2.write(bytes([Command.PLAYRESULT.value, Result.LOSE.value]))
+                elif result == -1:
+                    writer1.write(bytes([Command.PLAYRESULT.value, Result.LOSE.value]))
+                    writer2.write(bytes([Command.PLAYRESULT.value, Result.WIN.value]))
+                else:
+                    writer1.write(bytes([Command.PLAYRESULT.value, Result.DRAW.value]))
+                    writer2.write(bytes([Command.PLAYRESULT.value, Result.DRAW.value]))
+
+                await writer1.drain()
+                await writer2.drain()
+
+            writer1.close()
+            writer2.close()
+            await writer1.wait_closed()
+            await writer2.wait_closed()
+
+        except Exception as e:
+            logging.error(f"Error during game: {e}")
+            await kill_game(game)
     
 
 async def limit_client(host, port, loop, sem):
